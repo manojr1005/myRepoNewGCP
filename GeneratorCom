@@ -1,89 +1,461 @@
-(venv) PS C:\PythonDevelopment\AdkTest\SteeringPolicyBot\utteranceVersionTwo-main> python .\Manisha_utterance_NLU_Testing_accent_gender4.py
+import pandas as pd
+import configparser
+import json
+import re
+from dfcx_scrapi.core.sessions import Sessions
+from dfcx_scrapi.core.flows import Flows
+from google.protobuf.json_format import MessageToDict
+from google.cloud.dialogflowcx_v3beta1.services.pages import PagesClient
+from google.cloud.dialogflowcx_v3beta1.types.session import QueryParameters
 
-[DEBUG] ── Starting Script ──────────────────────────────────────
-[DEBUG] agent_id        : projects/uoamaeeo-cava-suv3-ob86-5xvn85/locations/us-central1/agents/f4ef5c78-afa6-4ff9-b5b0-844f34f376f4
-[DEBUG] excel_file      : InputExcelApril2026\GeneratorTestingV2.xlsx
-[DEBUG] sheet_name      : 0
-[DEBUG] flow            : Member Authentication
-[DEBUG] page            : Collect MemberId
-[DEBUG] utterances_col  : Raw STT Input (Faulty)
-[DEBUG] intent_column   : Expected Normalized Output
-[DEBUG] result_file     : output_generator7.csv
-[DEBUG] language_code   : en
 
-[DEBUG] Initializing Sessions...
-2026-04-21 00:33:36 INFO     Found user creds, skipping global scopes...
-[DEBUG] Sessions initialized
+# ─── Config Helper ───────────────────────────────────────────────────────────
 
-[PAGE] Resolving flow='Member Authentication' page='Collect MemberId'...
-2026-04-21 00:33:39 INFO     Found user creds, skipping global scopes...
-[PAGE] ✅ Flow : projects/uoamaeeo-cava-suv3-ob86-5xvn85/locations/us-central1/agents/f4ef5c78-afa6-4ff9-b5b0-844f34f376f4/flows/11f6283d-61d4-4ff9-b4b0-4fe1680d0f17
-[PAGE] ❌ Error: 400 Please refer to https://cloud.google.com/dialogflow/cx/docs/concept/region#avail and https://cloud.google.com/dialogflow/es/docs/how/region#regions to find the correct endpoint to access resources located in 'us-central1'.
-[DEBUG] ⚠️  No page context — results will likely be wrong
+def get_config_string(config, section, option, default_value=""):
+    try:
+        return config.get(section, option)
+    except (configparser.NoSectionError, configparser.NoOptionError):
+        return default_value
 
-[DEBUG] Excel loaded — shape: (1, 4)
-[DEBUG] Columns: ['#', 'Raw STT Input (Faulty)', 'Expected Normalized Output', 'Regex Branch']
-[DEBUG] ✅ Column: 'Raw STT Input (Faulty)'
-[DEBUG] ✅ Column: 'Expected Normalized Output'
-[DEBUG] Total rows: 1
 
-========================================================================
-[DEBUG] Row 1/1
-[DEBUG] Test Case       : USW zero one two three four five six seven eight nine
-[DEBUG] Utterance       : USW zero one two three four five six seven eight nine
-[DEBUG] Expected Output : USW012345678
-[DEBUG] Session ID      : projects/uoamaeeo-cava-suv3-ob86-5xvn85/locations/us-central1/agents/f4ef5c78-afa6-4ff9-b5b0-844f34f376f4/sessions/865f0972-7a54-4ae3-8e02-0678fc6037f9
+# ─── Extract region from agent_id ────────────────────────────────────────────
 
-  [TURN1] Sending entry event to reach 'None'...
-**1session
-Printing SessionID*&*:projects/uoamaeeo-cava-suv3-ob86-5xvn85/locations/us-central1/agents/f4ef5c78-afa6-4ff9-b5b0-844f34f376f4/sessions/865f0972-7a54-4ae3-8e02-0678fc6037f9
-**2
-**3
-**4
-  [TURN1] Agent prompt: 'I missed what you said. What was that?'
-  [TURN1] Page after turn1: Start Page
+def extract_region(agent_id: str) -> str:
+    """
+    Pulls the region from the agent resource name.
+    e.g. projects/.../locations/us-central1/agents/... → 'us-central1'
+    """
+    parts = agent_id.split("/")
+    try:
+        idx = parts.index("locations")
+        return parts[idx + 1]
+    except (ValueError, IndexError):
+        return "us-central1"
 
-  [TURN2] Sending utterance: 'USW zero one two three four five six seven eight nine'
-**1session
-Printing SessionID*&*:projects/uoamaeeo-cava-suv3-ob86-5xvn85/locations/us-central1/agents/f4ef5c78-afa6-4ff9-b5b0-844f34f376f4/sessions/865f0972-7a54-4ae3-8e02-0678fc6037f9
-**2
-**3
-**4
-  [TURN2] Agent reply  : 'What was that?'
-  [TURN2] Page after turn2: Start Page
-  [TURN2] Match type   : 4
 
-[DEBUG] Extracting params from Turn 1...
-  [PARAMS:T1] session_info: not present in this SDK version
-  [PARAMS:T1] query_result.parameters: empty
-  [PARAMS:T1] match.parameters: empty
-  [PARAMS:T1] generative action[1] agent_utterance: 'I missed what you said. What was that?'
-  [PARAMS:T1] ❌ No parameters found anywhere
+# ─── Page Resolver (regional endpoint) ───────────────────────────────────────
 
-[DEBUG] Extracting params from Turn 2...
-  [PARAMS:T2] session_info: not present in this SDK version
-  [PARAMS:T2] query_result.parameters: empty
-  [PARAMS:T2] match.parameters: empty
-  [PARAMS:T2] generative action[1] agent_utterance: 'What was that?'
-  [PARAMS:T2] ❌ No parameters found anywhere
+def resolve_page_name(agent_id, flow_display_name, page_display_name):
+    print(f"\n[PAGE] Resolving flow='{flow_display_name}' page='{page_display_name}'...")
 
-[DEBUG] Merged params: {}
-[DEBUG] Agent reply: 'What was that?'
-  [MEMBERID] Trying text fallback from agent reply...
-[DEBUG] Final MemberID  : ''
-[DEBUG] Match           : False
-[DEBUG] Turn1 page      : Start Page
-[DEBUG] Turn2 page      : Start Page
+    region = extract_region(agent_id)
+    regional_endpoint = f"{region}-dialogflow.googleapis.com"
+    print(f"[PAGE] Using regional endpoint: {regional_endpoint}")
 
-[DEBUG] Results shape: (1, 9)
+    try:
+        # Step 1: find the flow
+        flows_client = Flows(agent_id=agent_id)
+        all_flows = flows_client.list_flows()
+        flow = next((f for f in all_flows if f.display_name == flow_display_name), None)
+        if not flow:
+            print(f"[PAGE] ⚠️  Flow '{flow_display_name}' not found")
+            print(f"[PAGE]     Available: {[f.display_name for f in all_flows]}")
+            return None
+        print(f"[PAGE] ✅ Flow: {flow.name}")
 
-🎯 MemberID extracted : 0/1 rows
-✅ Correct matches   : 0/1 rows
+        # Step 2: PagesClient with regional endpoint (fixes the 400 error)
+        client = PagesClient(client_options={"api_endpoint": regional_endpoint})
+        all_pages = list(client.list_pages(request={"parent": flow.name}))
+        print(f"[PAGE]     Available pages: {[p.display_name for p in all_pages]}")
 
-                                               utterance     agent_reply extracted_member_id  match  turn1_page  turn2_page
-0  USW zero one two three four five six seven eight nine  What was that?                      False  Start Page  Start Page
+        page = next((p for p in all_pages if p.display_name == page_display_name), None)
+        if not page:
+            print(f"[PAGE] ⚠️  Page '{page_display_name}' not found")
+            return None
+        print(f"[PAGE] ✅ Page: {page.name}")
+        return page.name
 
-✅ Saved: output_generator7.csv
-[DEBUG] ── Script Complete ───────────────────────────────────────
+    except Exception as e:
+        print(f"[PAGE] ❌ Error: {e}")
+        return None
 
-(venv) PS C:\PythonDevelopment\AdkTest\SteeringPolicyBot\utteranceVersionTwo-main> 
+
+# ─── Extract session parameters ──────────────────────────────────────────────
+
+def extract_session_params(query_result, label=""):
+    all_params = {}
+
+    # Method 1: session_info.parameters
+    try:
+        si = getattr(query_result, "session_info", None)
+        if si:
+            sp = getattr(si, "parameters", None)
+            if sp:
+                try:
+                    decoded = MessageToDict(sp)
+                    if decoded:
+                        print(f"  [PARAMS:{label}] ✅ session_info.parameters: {decoded}")
+                        all_params.update(decoded)
+                except Exception:
+                    try:
+                        decoded = dict(sp)
+                        if decoded:
+                            print(f"  [PARAMS:{label}] ✅ session_info.parameters (dict): {decoded}")
+                            all_params.update(decoded)
+                    except Exception as e:
+                        print(f"  [PARAMS:{label}] session_info error: {e}")
+            else:
+                print(f"  [PARAMS:{label}] session_info.parameters: empty")
+        else:
+            print(f"  [PARAMS:{label}] session_info: not in this SDK version")
+    except Exception as e:
+        print(f"  [PARAMS:{label}] session_info error: {e}")
+
+    # Method 2: query_result.parameters
+    try:
+        qp = query_result.parameters
+        if qp:
+            try:
+                decoded = MessageToDict(qp)
+                if decoded:
+                    print(f"  [PARAMS:{label}] ✅ query_result.parameters: {decoded}")
+                    all_params.update(decoded)
+            except Exception as e:
+                print(f"  [PARAMS:{label}] query_result.parameters error: {e}")
+        else:
+            print(f"  [PARAMS:{label}] query_result.parameters: empty")
+    except Exception as e:
+        print(f"  [PARAMS:{label}] query_result.parameters error: {e}")
+
+    # Method 3: match.parameters
+    try:
+        mp = query_result.match.parameters if query_result.match else None
+        if mp:
+            try:
+                decoded = MessageToDict(mp)
+                if decoded:
+                    print(f"  [PARAMS:{label}] ✅ match.parameters: {decoded}")
+                    all_params.update(decoded)
+            except Exception as e:
+                print(f"  [PARAMS:{label}] match.parameters error: {e}")
+        else:
+            print(f"  [PARAMS:{label}] match.parameters: empty")
+    except Exception as e:
+        print(f"  [PARAMS:{label}] match.parameters error: {e}")
+
+    # Method 4: generative_info actions
+    try:
+        gi = getattr(query_result, "generative_info", None)
+        if gi:
+            ati = getattr(gi, "action_tracing_info", None)
+            if ati:
+                for idx, action in enumerate(getattr(ati, "actions", [])):
+                    au = getattr(action, "agent_utterance", None)
+                    if au:
+                        print(f"  [PARAMS:{label}] generative action[{idx}] "
+                              f"agent_utterance: '{getattr(au, 'text', '')}'")
+                    tu = getattr(action, "tool_use", None)
+                    if tu:
+                        for attr in ("input_action_parameters", "output_action_parameters"):
+                            val = getattr(tu, attr, None)
+                            if val:
+                                try:
+                                    decoded = MessageToDict(val)
+                                    print(f"  [PARAMS:{label}] ✅ tool_use {attr}: {decoded}")
+                                    all_params.update(decoded)
+                                except Exception:
+                                    pass
+    except Exception as e:
+        print(f"  [PARAMS:{label}] generative_info error: {e}")
+
+    if not all_params:
+        print(f"  [PARAMS:{label}] ❌ No parameters found")
+
+    return all_params
+
+
+# ─── Extract agent reply text ─────────────────────────────────────────────────
+
+def extract_agent_reply(query_result) -> str:
+    try:
+        for msg in query_result.response_messages:
+            text_block = getattr(msg, "text", None)
+            if text_block:
+                texts = getattr(text_block, "text", [])
+                if texts:
+                    return " ".join(texts)
+    except Exception:
+        pass
+    return ""
+
+
+# ─── Extract MemberID ────────────────────────────────────────────────────────
+
+def extract_member_id(params: dict, agent_reply: str = "", member_id_pattern: str = "") -> str:
+    # Search params dict first
+    if isinstance(params, dict) and params:
+        print(f"  [MEMBERID] Searching keys: {list(params.keys())}")
+        for key in ("MemberID", "memberId", "memberid", "member_id", "MEMBERID",
+                    "MemberId", "Memberid", "member-id", "normalized_member_id",
+                    "normalizedMemberId", "member_number", "memberNumber"):
+            if key in params:
+                val = params[key]
+                print(f"  [MEMBERID] ✅ Key='{key}' → '{val}'")
+                if isinstance(val, dict):
+                    return str(val.get("original") or val.get("resolved") or
+                               val.get("value") or "")
+                return str(val)
+
+        for key, val in params.items():
+            nk = key.lower().replace("_", "").replace("-", "")
+            if nk in ("memberid", "membernumber", "normalizedmemberid"):
+                print(f"  [MEMBERID] ✅ Case-insensitive key='{key}' → '{val}'")
+                if isinstance(val, dict):
+                    return str(val.get("original") or val.get("resolved") or
+                               val.get("value") or "")
+                return str(val)
+
+        for key, val in params.items():
+            if isinstance(val, dict):
+                nested = extract_member_id(val)
+                if nested:
+                    print(f"  [MEMBERID] ✅ Nested under '{key}' → '{nested}'")
+                    return nested
+
+    # Fallback: extract from agent reply text using configurable regex
+    if agent_reply:
+        print(f"  [MEMBERID] Trying text fallback on: '{agent_reply}'")
+        pattern = member_id_pattern if member_id_pattern else r'\b([A-Z]{2,3}\d{6,12})\b'
+        match = re.search(pattern, agent_reply, re.IGNORECASE)
+        if match:
+            result = match.group(1).upper()
+            print(f"  [MEMBERID] ✅ Extracted from reply text: '{result}'")
+            return result
+
+    print("  [MEMBERID] ❌ Not found")
+    return ""
+
+
+# ─── Two-turn session ─────────────────────────────────────────────────────────
+
+def run_two_turn_session(sessions, agent_id, session_id,
+                         page_name, entry_utterance, member_utterance,
+                         language_code="en"):
+    """
+    Turn 1: send entry_utterance on the target page to trigger entry fulfillment
+            (the agent's opening prompt asking for member ID).
+    Turn 2: send the actual member ID utterance — Generator processes it
+            and sets the session parameter.
+    """
+    query_params = QueryParameters(current_page=page_name) if page_name else None
+
+    # ── Turn 1 ───────────────────────────────────────────────────────────
+    print(f"\n  [TURN1] Entry utterance: '{entry_utterance}'")
+    turn1_result = None
+    try:
+        kwargs = dict(
+            agent_id=agent_id,
+            session_id=session_id,
+            text=entry_utterance,
+            language_code=language_code,
+        )
+        if query_params:
+            kwargs["query_params"] = query_params
+        turn1_result = sessions.detect_intent(**kwargs)
+        reply1 = extract_agent_reply(turn1_result)
+        page1  = turn1_result.current_page.display_name
+        print(f"  [TURN1] ✅ Agent: '{reply1}' | Page: '{page1}'")
+    except Exception as e:
+        print(f"  [TURN1] ❌ Failed: {e}")
+
+    # ── Turn 2 ───────────────────────────────────────────────────────────
+    print(f"\n  [TURN2] Member ID utterance: '{member_utterance}'")
+    turn2_result = None
+    try:
+        kwargs = dict(
+            agent_id=agent_id,
+            session_id=session_id,
+            text=member_utterance,
+            language_code=language_code,
+        )
+        if query_params:
+            kwargs["query_params"] = query_params
+        turn2_result = sessions.detect_intent(**kwargs)
+        reply2 = extract_agent_reply(turn2_result)
+        page2  = turn2_result.current_page.display_name
+        mt     = turn2_result.match.match_type
+        print(f"  [TURN2] ✅ Agent: '{reply2}' | Page: '{page2}' | match_type: {mt}")
+    except Exception as e:
+        print(f"  [TURN2] ❌ Failed: {e}")
+
+    return turn1_result, turn2_result
+
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+
+def main():
+    print("\n[DEBUG] ── Starting Script ──────────────────────────────────────")
+
+    config = configparser.ConfigParser()
+    config.read("Manisha_config1.properties")
+
+    agent_id          = config.get("dialogflow", "agent_id")
+    excel_file        = config.get("input", "excel_file")
+    sheet_name_raw    = config.get("input", "sheet_name")
+    flow_display_name = config.get("input", "flow_display_name")
+    page_display_name = config.get("input", "page_display_name")
+    utterances_col    = config.get("input", "Utterances")
+    intent_column     = config.get("input", "intent_column")
+    test_case_column  = get_config_string(config, "input", "test_case_column", "Test Case name")
+    result_file       = config.get("output", "result_file")
+    language_code     = get_config_string(config, "input", "language_code", "en")
+
+    # Entry utterance = what a real caller says BEFORE giving their member ID
+    # e.g. "hello", "hi", or whatever triggers the flow to reach Collect MemberId
+    # Set this in your config as entry_utterance or leave blank to use "hello"
+    entry_utterance   = get_config_string(config, "input", "entry_utterance", "hello")
+
+    # Regex pattern to extract member ID from agent reply text (fallback)
+    # Default: 2-3 uppercase letters followed by 6-12 digits e.g. USW012345678
+    member_id_pattern = get_config_string(config, "input", "member_id_pattern",
+                                          r'\b([A-Z]{2,3}\d{6,12})\b')
+
+    try:
+        sheet_name = int(sheet_name_raw)
+    except ValueError:
+        sheet_name = sheet_name_raw
+
+    print(f"[DEBUG] agent_id          : {agent_id}")
+    print(f"[DEBUG] excel_file        : {excel_file}")
+    print(f"[DEBUG] sheet_name        : {sheet_name}")
+    print(f"[DEBUG] flow              : {flow_display_name}")
+    print(f"[DEBUG] page              : {page_display_name}")
+    print(f"[DEBUG] utterances_col    : {utterances_col}")
+    print(f"[DEBUG] intent_column     : {intent_column}")
+    print(f"[DEBUG] entry_utterance   : {entry_utterance}")
+    print(f"[DEBUG] member_id_pattern : {member_id_pattern}")
+    print(f"[DEBUG] result_file       : {result_file}")
+    print(f"[DEBUG] language_code     : {language_code}")
+    print(f"[DEBUG] region            : {extract_region(agent_id)}")
+
+    # ─── Sessions ─────────────────────────────────────────────────────────
+    print("\n[DEBUG] Initializing Sessions...")
+    sessions = Sessions(agent_id=agent_id)
+    print("[DEBUG] Sessions initialized")
+
+    # ─── Resolve page ─────────────────────────────────────────────────────
+    current_page_name = resolve_page_name(agent_id, flow_display_name, page_display_name)
+    if current_page_name:
+        print(f"[DEBUG] ✅ Page context: {current_page_name}")
+    else:
+        print("[DEBUG] ⚠️  Page context unavailable — agent will start from Default Start Flow")
+        print("[DEBUG]     Turn 1 entry utterance will be used to navigate naturally")
+
+    # ─── Read Excel ───────────────────────────────────────────────────────
+    df = pd.read_excel(excel_file, sheet_name=sheet_name)
+    print(f"\n[DEBUG] Excel loaded — shape: {df.shape}")
+    print(f"[DEBUG] Columns: {df.columns.tolist()}")
+
+    for col in [utterances_col, intent_column]:
+        if col not in df.columns:
+            raise ValueError(f"[ERROR] Missing column '{col}' in Excel")
+        print(f"[DEBUG] ✅ Column: '{col}'")
+
+    if test_case_column not in df.columns:
+        print(f"[DEBUG] ⚠️  '{test_case_column}' not found — using utterance as name")
+
+    df = df.reset_index(drop=True)
+    total = len(df)
+    print(f"[DEBUG] Total rows: {total}")
+
+    rows = []
+
+    for i, row in df.iterrows():
+        utterance       = str(row[utterances_col])
+        expected_output = str(row[intent_column])
+        test_case_name  = str(row[test_case_column]) if test_case_column in df.columns else utterance
+
+        print(f"\n{'='*72}")
+        print(f"[DEBUG] Row {i+1}/{total}")
+        print(f"[DEBUG] Test Case       : {test_case_name}")
+        print(f"[DEBUG] Utterance       : {utterance}")
+        print(f"[DEBUG] Expected Output : {expected_output}")
+
+        session_id = sessions.build_session_id(agent_id=agent_id)
+        print(f"[DEBUG] Session ID      : {session_id}")
+
+        try:
+            turn1_result, turn2_result = run_two_turn_session(
+                sessions=sessions,
+                agent_id=agent_id,
+                session_id=session_id,
+                page_name=current_page_name,
+                entry_utterance=entry_utterance,
+                member_utterance=utterance,
+                language_code=language_code,
+            )
+        except Exception as e:
+            print(f"[ERROR] Session failed: {e}")
+            rows.append({
+                test_case_column:      test_case_name,
+                "utterance":           utterance,
+                "expected_output":     expected_output,
+                "agent_reply_turn1":   "ERROR",
+                "agent_reply_turn2":   "ERROR",
+                "extracted_member_id": "",
+                "match":               False,
+                "all_parameters":      "{}",
+                "turn1_page":          "",
+                "turn2_page":          "",
+            })
+            continue
+
+        # ─── Extract params from both turns ───────────────────────────────
+        print(f"\n[DEBUG] Extracting params — Turn 1...")
+        params_t1 = extract_session_params(turn1_result, "T1") if turn1_result else {}
+
+        print(f"\n[DEBUG] Extracting params — Turn 2...")
+        params_t2 = extract_session_params(turn2_result, "T2") if turn2_result else {}
+
+        all_params = {**params_t1, **params_t2}  # T2 wins on conflict
+        print(f"\n[DEBUG] Merged params: {all_params}")
+
+        agent_reply_t1 = extract_agent_reply(turn1_result) if turn1_result else ""
+        agent_reply_t2 = extract_agent_reply(turn2_result) if turn2_result else ""
+        print(f"[DEBUG] Turn1 reply: '{agent_reply_t1}'")
+        print(f"[DEBUG] Turn2 reply: '{agent_reply_t2}'")
+
+        # ─── Extract MemberID ─────────────────────────────────────────────
+        # Try params first, then fall back to Turn2 reply text
+        member_id = extract_member_id(all_params, agent_reply_t2, member_id_pattern)
+        print(f"[DEBUG] Final MemberID  : '{member_id}'")
+
+        is_match = (expected_output.strip().upper() == member_id.strip().upper())
+        print(f"[DEBUG] Match           : {is_match}")
+
+        turn1_page = turn1_result.current_page.display_name if turn1_result else ""
+        turn2_page = turn2_result.current_page.display_name if turn2_result else ""
+
+        rows.append({
+            test_case_column:      test_case_name,
+            "utterance":           utterance,
+            "expected_output":     expected_output,
+            "agent_reply_turn1":   agent_reply_t1,
+            "agent_reply_turn2":   agent_reply_t2,
+            "extracted_member_id": member_id,
+            "match":               is_match,
+            "all_parameters":      json.dumps(all_params),
+            "turn1_page":          turn1_page,
+            "turn2_page":          turn2_page,
+        })
+
+    # ─── Save ─────────────────────────────────────────────────────────────
+    results = pd.DataFrame(rows)
+    found   = results[results["extracted_member_id"] != ""]
+    matched = results[results["match"] == True]
+
+    print(f"\n[DEBUG] Results shape: {results.shape}")
+    print(f"\n🎯 MemberID extracted : {len(found)}/{len(results)} rows")
+    print(f"✅ Correct matches   : {len(matched)}/{len(results)} rows")
+    print("\n" + results[[
+        "utterance", "agent_reply_turn1", "agent_reply_turn2",
+        "extracted_member_id", "match", "turn1_page", "turn2_page"
+    ]].to_string())
+
+    results.to_csv(result_file, index=False)
+    print(f"\n✅ Saved: {result_file}")
+    print("[DEBUG] ── Script Complete ───────────────────────────────────────\n")
+
+
+if __name__ == "__main__":
+    main()
