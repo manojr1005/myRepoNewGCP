@@ -92,16 +92,17 @@ def main():
         utterance      = str(row[utterances_col])
         expected_intent = str(row[intent_column])
         test_case_name  = str(row[test_case_column])
+        session_id = sessions.build_session_id(agent_id=agent_id)
 
         # Call detect_intent — returns full QueryResult
-        response = sessions.detect_intent(
+        query_result = sessions.detect_intent(
             agent_id=agent_id,
-            session_id=f"test-session-{i}",
+            session_id=session_id,
             text=utterance,
             language_code="en"
         )
 
-        query_result = response.query_result
+        #query_result = response.query_result
 
         # ─── Extract detected intent ───────────────────────────────────────
         detected_intent = ""
