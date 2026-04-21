@@ -3,7 +3,10 @@ import configparser
 import json
 from dfcx_scrapi.core.conversation import DialogflowConversation
 from dfcx_scrapi.core.sessions import Sessions
+from dfcx_scrapi.core.flows import Flows
+from dfcx_scrapi.core.pages import Pages
 from google.protobuf.json_format import MessageToDict
+from google.cloud.dialogflowcx_v3beta1.types import session as session_types
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
@@ -29,7 +32,6 @@ def extract_member_id(params: dict) -> str:
                 return str(val.get("original") or val.get("resolved") or "")
             return str(val)
 
-    # Case-insensitive fallback
     for key, val in params.items():
         if key.lower().replace("_", "") == "memberid":
             print(f"  [DEBUG] ✅ Fallback found key='{key}' value='{val}'")
@@ -50,8 +52,36 @@ def print_parameters_debug(row_index, utterance, params: dict):
             marker = " ✅ <-- MemberID" if key.lower().replace("_", "") == "memberid" else ""
             print(f"    {key:30s} : {val}{marker}")
     else:
-        print("  ⚠️  No parameters returned")
+        print("  ⚠️  No parameters returned — likely wrong page context")
     print("="*70)
+
+
+def get_page_id(agent_id, flow_display_name, page_display_name):
+    """
+    Resolves flow_display_name + page_display_name → full page resource name.
+    This is required to pass current_page in QueryParams so the bot
+    knows which page/form to evaluate the utterance against.
+    """
+    print(f"\n[DEBUG] Resolving page ID for flow='{flow_display_name}', page='{page_display_name}'")
+    flows_client = Flows(agent_id=agent_id)
+    flows_map = flows_client.get_flows_map(agent_id=agent_id, reverse=True)
+    print(f"[DEBUG] Available flows: {list(flows_map.keys())}")
+
+    flow_id = flows_map.get(flow_display_name)
+    if not flow_id:
+        raise ValueError(f"Flow '{flow_display_name}' not found in agent")
+    print(f"[DEBUG] Flow ID: {flow_id}")
+
+    pages_client = Pages(agent_id=agent_id)
+    pages_map = pages_client.get_pages_map(flow_id=flow_id, reverse=True)
+    print(f"[DEBUG] Available pages: {list(pages_map.keys())}")
+
+    page_id = pages_map.get(page_display_name)
+    if not page_id:
+        raise ValueError(f"Page '{page_display_name}' not found in flow '{flow_display_name}'")
+    print(f"[DEBUG] ✅ Page ID resolved: {page_id}")
+
+    return page_id
 
 
 # ─── Main ───────────────────────────────────────────────────────────────────
@@ -81,16 +111,15 @@ def main():
     print(f"[DEBUG] flow            : {flow_display_name}")
     print(f"[DEBUG] page            : {page_display_name}")
 
-    # ── Step 1: Use DialogflowConversation.run_intent_detection for intent ──
-    # This correctly routes via flow + page but doesn't return parameters
-    print("\n[DEBUG] Initializing DialogflowConversation...")
+    # ── Resolve the exact page resource name ──────────────────────────────
+    # This is the KEY FIX — we tell detect_intent which page to evaluate on
+    page_resource_name = get_page_id(agent_id, flow_display_name, page_display_name)
+
+    # ── Initialize clients ────────────────────────────────────────────────
     conversation = DialogflowConversation(agent_id=agent_id)
+    sessions     = Sessions(agent_id=agent_id)
 
-    # ── Step 2: Use Sessions.detect_intent for parameters ──────────────────
-    print("[DEBUG] Initializing Sessions...")
-    sessions = Sessions(agent_id=agent_id)
-
-    # ── Read Excel ─────────────────────────────────────────────────────────
+    # ── Read Excel ────────────────────────────────────────────────────────
     df = pd.read_excel(excel_file, sheet_name=sheet_name)
     print(f"\n[DEBUG] Excel loaded — shape: {df.shape}")
     print(f"[DEBUG] Columns: {df.columns.tolist()}")
@@ -101,7 +130,7 @@ def main():
 
     df = df.reset_index(drop=True)
 
-    # ── Step 3: Build test_set and run_intent_detection for intent results ──
+    # ── run_intent_detection for intent matching (uses flow+page routing) ─
     test_set = pd.DataFrame({
         "flow_display_name": [flow_display_name] * len(df),
         "page_display_name": [page_display_name] * len(df),
@@ -112,14 +141,11 @@ def main():
 
     print(f"\n[DEBUG] Running run_intent_detection for {len(df)} utterances...")
     intent_results = conversation.run_intent_detection(
-        test_set,
-        10,   # concurrency
-        100   # timeout
+        test_set, 10, 100
     ).reset_index(drop=True)
+    print(f"[DEBUG] Intent result columns: {intent_results.columns.tolist()}")
 
-    print(f"[DEBUG] Intent results columns: {intent_results.columns.tolist()}")
-
-    # ── Step 4: Loop and call detect_intent per row to get parameters ───────
+    # ── Loop: call detect_intent with current_page to get parameters ──────
     rows = []
     total = len(df)
 
@@ -127,8 +153,6 @@ def main():
         utterance       = str(row[utterances_col])
         expected_intent = str(row[intent_column])
         test_case_name  = str(row[test_case_column])
-
-        # Get detected intent from run_intent_detection results
         detected_intent = str(intent_results["detected_intent"].iloc[i]) \
             if "detected_intent" in intent_results.columns else ""
 
@@ -137,64 +161,46 @@ def main():
         print(f"[DEBUG] Expected Intent: {expected_intent}")
         print(f"[DEBUG] Detected Intent: {detected_intent}")
 
-        # ── Call Sessions.detect_intent to get parameters ─────────────────
         params_dict = {}
         try:
             session_id = sessions.build_session_id(agent_id=agent_id)
-            print(f"[DEBUG] Calling detect_intent, session: {session_id}")
 
-            # ✅ KEY FIX: dfcx_scrapi Sessions.detect_intent returns
-            # the QueryResult directly (NOT a response wrapper)
+            # ✅ KEY FIX: Pass current_page so Dialogflow evaluates the
+            # utterance in the context of the correct page/form
+            # Without this, parameters are always empty (wrong page context)
+            query_params = session_types.QueryParameters(
+                current_page=page_resource_name
+            )
+
+            print(f"[DEBUG] Calling detect_intent with current_page: {page_resource_name}")
+
             query_result = sessions.detect_intent(
                 agent_id=agent_id,
                 session_id=session_id,
                 text=utterance,
-                language_code="en"
+                language_code="en",
+                query_params=query_params
             )
 
-            print(f"[DEBUG] query_result type    : {type(query_result)}")
-            print(f"[DEBUG] query_result dir     : {[x for x in dir(query_result) if not x.startswith('_')]}")
+            print(f"[DEBUG] query_result type     : {type(query_result)}")
+            print(f"[DEBUG] raw parameters        : {query_result.parameters}")
 
-            # ── Try to get parameters ─────────────────────────────────────
-            # Check what attribute holds parameters
-            if hasattr(query_result, "parameters"):
-                raw_params = query_result.parameters
-                print(f"[DEBUG] raw parameters type  : {type(raw_params)}")
-                print(f"[DEBUG] raw parameters value : {raw_params}")
-
-                if raw_params:
-                    try:
-                        params_dict = MessageToDict(raw_params)
-                        print(f"[DEBUG] ✅ MessageToDict result: {params_dict}")
-                    except Exception as e:
-                        print(f"[DEBUG] MessageToDict failed: {e}")
-                        params_dict = dict(raw_params)
-                        print(f"[DEBUG] dict() fallback result: {params_dict}")
-                else:
-                    print("[DEBUG] ⚠️  parameters field is empty")
-
-            elif hasattr(query_result, "query_result"):
-                # Some versions wrap it — unwrap
-                inner = query_result.query_result
-                print(f"[DEBUG] Unwrapping query_result.query_result: {type(inner)}")
-                if hasattr(inner, "parameters") and inner.parameters:
-                    params_dict = MessageToDict(inner.parameters)
-                    print(f"[DEBUG] ✅ Inner parameters: {params_dict}")
+            if query_result.parameters:
+                params_dict = MessageToDict(query_result.parameters)
+                print(f"[DEBUG] ✅ params_dict: {params_dict}")
             else:
-                print(f"[DEBUG] ❌ No 'parameters' attribute found on query_result")
+                print("[DEBUG] ⚠️  parameters still empty after page context set")
 
         except Exception as e:
             print(f"[ERROR] detect_intent failed for row {i}: {e}")
 
-        # ── Debug print all params ─────────────────────────────────────────
         print_parameters_debug(i, utterance, params_dict)
 
-        # ── Extract MemberID ───────────────────────────────────────────────
-        member_id = extract_member_id(params_dict)
-        print(f"[DEBUG] Final extracted_member_id: '{member_id}'")
-
+        member_id    = extract_member_id(params_dict)
         intent_match = expected_intent == detected_intent
-        print(f"[DEBUG] Intent match: {intent_match}")
+
+        print(f"[DEBUG] extracted_member_id: '{member_id}'")
+        print(f"[DEBUG] intent_match       : {intent_match}")
 
         rows.append({
             test_case_column:      test_case_name,
@@ -206,7 +212,6 @@ def main():
             "extracted_member_id": member_id,
         })
 
-    # ── Build Results ──────────────────────────────────────────────────────
     results = pd.DataFrame(rows)
 
     found = results[results["extracted_member_id"] != ""]
