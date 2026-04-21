@@ -1,12 +1,14 @@
 import pandas as pd
 import configparser
 import json
+import uuid
+from google.cloud.dialogflowcx_v3beta1.services.sessions import SessionsClient
+from google.cloud.dialogflowcx_v3beta1.types import session as cx_session
+from google.api_core.client_options import ClientOptions
+from google.protobuf.json_format import MessageToDict
 from dfcx_scrapi.core.conversation import DialogflowConversation
-from dfcx_scrapi.core.sessions import Sessions
 from dfcx_scrapi.core.flows import Flows
 from dfcx_scrapi.core.pages import Pages
-from google.protobuf.json_format import MessageToDict
-from google.cloud.dialogflowcx_v3beta1.types import session as session_types
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
@@ -17,7 +19,33 @@ def get_config_string(config, section, option, default_value):
         return default_value
 
 
+def get_page_resource_name(agent_id, flow_display_name, page_display_name):
+    """Resolves flow + page display names to full page resource name."""
+    print(f"\n[DEBUG] Resolving page: flow='{flow_display_name}', page='{page_display_name}'")
+
+    flows_client = Flows()
+    flows_map = flows_client.get_flows_map(agent_id=agent_id, reverse=True)
+    print(f"[DEBUG] Available flows: {list(flows_map.keys())}")
+
+    flow_id = flows_map.get(flow_display_name)
+    if not flow_id:
+        raise ValueError(f"Flow '{flow_display_name}' not found in agent")
+    print(f"[DEBUG] Flow ID: {flow_id}")
+
+    pages_client = Pages()
+    pages_map = pages_client.get_pages_map(flow_id=flow_id, reverse=True)
+    print(f"[DEBUG] Available pages: {list(pages_map.keys())}")
+
+    page_id = pages_map.get(page_display_name)
+    if not page_id:
+        raise ValueError(f"Page '{page_display_name}' not found in flow '{flow_display_name}'")
+    print(f"[DEBUG] ✅ Page resource name resolved: {page_id}")
+
+    return page_id
+
+
 def extract_member_id(params: dict) -> str:
+    """Extracts MemberID from parameters dict."""
     if not isinstance(params, dict):
         print("  [DEBUG] extract_member_id: not a dict:", type(params))
         return ""
@@ -32,6 +60,7 @@ def extract_member_id(params: dict) -> str:
                 return str(val.get("original") or val.get("resolved") or "")
             return str(val)
 
+    # Case-insensitive fallback
     for key, val in params.items():
         if key.lower().replace("_", "") == "memberid":
             print(f"  [DEBUG] ✅ Fallback found key='{key}' value='{val}'")
@@ -52,36 +81,8 @@ def print_parameters_debug(row_index, utterance, params: dict):
             marker = " ✅ <-- MemberID" if key.lower().replace("_", "") == "memberid" else ""
             print(f"    {key:30s} : {val}{marker}")
     else:
-        print("  ⚠️  No parameters returned — likely wrong page context")
+        print("  ⚠️  No parameters returned")
     print("="*70)
-
-
-def get_page_id(agent_id, flow_display_name, page_display_name):
-    """
-    Resolves flow_display_name + page_display_name → full page resource name.
-    This is required to pass current_page in QueryParams so the bot
-    knows which page/form to evaluate the utterance against.
-    """
-    print(f"\n[DEBUG] Resolving page ID for flow='{flow_display_name}', page='{page_display_name}'")
-    flows_client = Flows(agent_id=agent_id)
-    flows_map = flows_client.get_flows_map(agent_id=agent_id, reverse=True)
-    print(f"[DEBUG] Available flows: {list(flows_map.keys())}")
-
-    flow_id = flows_map.get(flow_display_name)
-    if not flow_id:
-        raise ValueError(f"Flow '{flow_display_name}' not found in agent")
-    print(f"[DEBUG] Flow ID: {flow_id}")
-
-    pages_client = Pages(agent_id=agent_id)
-    pages_map = pages_client.get_pages_map(flow_id=flow_id, reverse=True)
-    print(f"[DEBUG] Available pages: {list(pages_map.keys())}")
-
-    page_id = pages_map.get(page_display_name)
-    if not page_id:
-        raise ValueError(f"Page '{page_display_name}' not found in flow '{flow_display_name}'")
-    print(f"[DEBUG] ✅ Page ID resolved: {page_id}")
-
-    return page_id
 
 
 # ─── Main ───────────────────────────────────────────────────────────────────
@@ -107,19 +108,32 @@ def main():
     test_case_column  = get_config_string(config, "input", "test_case_column", "Test Case name")
     result_file       = config.get("output", "result_file")
 
-    print(f"[DEBUG] agent_id        : {agent_id}")
-    print(f"[DEBUG] flow            : {flow_display_name}")
-    print(f"[DEBUG] page            : {page_display_name}")
+    # ── Get location from agent_id ─────────────────────────────────────────
+    # agent_id format: projects/<proj>/locations/<location>/agents/<id>
+    location = agent_id.split("/locations/")[1].split("/")[0]
+    print(f"[DEBUG] agent_id : {agent_id}")
+    print(f"[DEBUG] location : {location}")
+    print(f"[DEBUG] flow     : {flow_display_name}")
+    print(f"[DEBUG] page     : {page_display_name}")
 
-    # ── Resolve the exact page resource name ──────────────────────────────
-    # This is the KEY FIX — we tell detect_intent which page to evaluate on
-    page_resource_name = get_page_id(agent_id, flow_display_name, page_display_name)
+    # ── Resolve page resource name ─────────────────────────────────────────
+    page_resource_name = get_page_resource_name(
+        agent_id, flow_display_name, page_display_name
+    )
 
-    # ── Initialize clients ────────────────────────────────────────────────
+    # ── Initialize DialogflowConversation for intent detection ─────────────
+    print("\n[DEBUG] Initializing DialogflowConversation...")
     conversation = DialogflowConversation(agent_id=agent_id)
-    sessions     = Sessions(agent_id=agent_id)
 
-    # ── Read Excel ────────────────────────────────────────────────────────
+    # ── Initialize raw Google CX client for parameters ─────────────────────
+    print("[DEBUG] Initializing raw CX SessionsClient...")
+    client_options = ClientOptions(
+        api_endpoint=f"{location}-dialogflow.googleapis.com"
+    )
+    cx_client = SessionsClient(client_options=client_options)
+    print("[DEBUG] CX SessionsClient initialized successfully")
+
+    # ── Read Excel ─────────────────────────────────────────────────────────
     df = pd.read_excel(excel_file, sheet_name=sheet_name)
     print(f"\n[DEBUG] Excel loaded — shape: {df.shape}")
     print(f"[DEBUG] Columns: {df.columns.tolist()}")
@@ -127,10 +141,11 @@ def main():
     for col in [utterances_col, intent_column, test_case_column]:
         if col not in df.columns:
             raise ValueError(f"[ERROR] Missing column '{col}' in Excel")
+        print(f"[DEBUG] ✅ Column found: '{col}'")
 
     df = df.reset_index(drop=True)
 
-    # ── run_intent_detection for intent matching (uses flow+page routing) ─
+    # ── Run intent detection via dfcx_scrapi (handles flow+page routing) ───
     test_set = pd.DataFrame({
         "flow_display_name": [flow_display_name] * len(df),
         "page_display_name": [page_display_name] * len(df),
@@ -145,7 +160,7 @@ def main():
     ).reset_index(drop=True)
     print(f"[DEBUG] Intent result columns: {intent_results.columns.tolist()}")
 
-    # ── Loop: call detect_intent with current_page to get parameters ──────
+    # ── Loop: use raw CX client to get parameters per row ──────────────────
     rows = []
     total = len(df)
 
@@ -163,39 +178,40 @@ def main():
 
         params_dict = {}
         try:
-            session_id = sessions.build_session_id(agent_id=agent_id)
+            # Build a fresh session ID per row
+            session_id = f"{agent_id}/sessions/{uuid.uuid4()}"
+            print(f"[DEBUG] Session ID: {session_id}")
 
-            # ✅ KEY FIX: Pass current_page so Dialogflow evaluates the
-            # utterance in the context of the correct page/form
-            # Without this, parameters are always empty (wrong page context)
-            query_params = session_types.QueryParameters(
-                current_page=page_resource_name
+            # ✅ Call raw Google CX client with current_page set
+            request = cx_session.DetectIntentRequest(
+                session=session_id,
+                query_input=cx_session.QueryInput(
+                    text=cx_session.TextInput(text=utterance),
+                    language_code="en"
+                ),
+                query_params=cx_session.QueryParameters(
+                    current_page=page_resource_name
+                )
             )
 
-            print(f"[DEBUG] Calling detect_intent with current_page: {page_resource_name}")
+            response = cx_client.detect_intent(request=request)
+            query_result = response.query_result
 
-            query_result = sessions.detect_intent(
-                agent_id=agent_id,
-                session_id=session_id,
-                text=utterance,
-                language_code="en",
-                query_params=query_params
-            )
-
-            print(f"[DEBUG] query_result type     : {type(query_result)}")
-            print(f"[DEBUG] raw parameters        : {query_result.parameters}")
+            print(f"[DEBUG] raw parameters: {query_result.parameters}")
 
             if query_result.parameters:
                 params_dict = MessageToDict(query_result.parameters)
                 print(f"[DEBUG] ✅ params_dict: {params_dict}")
             else:
-                print("[DEBUG] ⚠️  parameters still empty after page context set")
+                print("[DEBUG] ⚠️  parameters still empty")
 
         except Exception as e:
             print(f"[ERROR] detect_intent failed for row {i}: {e}")
 
+        # ── Debug print all parameters ─────────────────────────────────────
         print_parameters_debug(i, utterance, params_dict)
 
+        # ── Extract MemberID ───────────────────────────────────────────────
         member_id    = extract_member_id(params_dict)
         intent_match = expected_intent == detected_intent
 
@@ -212,7 +228,9 @@ def main():
             "extracted_member_id": member_id,
         })
 
+    # ── Build Results ──────────────────────────────────────────────────────
     results = pd.DataFrame(rows)
+    print(f"\n[DEBUG] Results shape: {results.shape}")
 
     found = results[results["extracted_member_id"] != ""]
     print(f"\n🎯 MemberID extracted in {len(found)}/{len(results)} rows")
