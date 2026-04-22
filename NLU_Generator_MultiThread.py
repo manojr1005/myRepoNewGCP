@@ -161,7 +161,6 @@ def process_row(
 
         if query_result.parameters:
             params_dict = extract_params_from_map(query_result.parameters)
-            #print(f"[DEBUG] Row {i+1} | ✅ params_dict: {params_dict}")
         else:
             print(f"[DEBUG] Row {i+1} | ⚠️  parameters empty after Turn 2")
 
@@ -181,10 +180,6 @@ def process_row(
     return i, {
         test_case_column:             test_case_name,
         "utterance":                  utterance,
-        #"expected_intent":            expected_intent,
-        #"detected_intent":            detected_intent,
-        #"intent_match":               intent_match,
-        #"all_parameters":             json.dumps(params_dict),
         "extracted_member_id":        member_id,
         "Expected Normalized Output": expected_output,
         "Matching":                   matching,
@@ -214,6 +209,29 @@ def main():
     test_case_column    = get_config_string(config, "input", "test_case_column", "Test Case name")
     result_file         = config.get("output", "result_file")
     expected_output_col = "Expected Normalized Output"
+
+    # ── Row range (optional) ───────────────────────────────────────────────
+    # Rows are 0-indexed and refer to data rows (excluding the header).
+    # Leave end_row blank (or omit it) to run through the last row.
+    # Examples in config:
+    #   start_row = 0        ← start from the first data row (default)
+    #   start_row = 10       ← skip the first 10 rows
+    #   end_row   = 49       ← stop after row index 49 (i.e. rows 10–49 → 40 rows)
+    #   end_row   =          ← run to the end of the sheet
+    start_row_raw = get_config_string(config, "input", "start_row", "0").strip()
+    end_row_raw   = get_config_string(config, "input", "end_row",   "").strip()
+
+    try:
+        start_row = int(start_row_raw) if start_row_raw else 0
+    except ValueError:
+        raise ValueError(f"[ERROR] start_row must be an integer, got: '{start_row_raw}'")
+
+    end_row = None
+    if end_row_raw:
+        try:
+            end_row = int(end_row_raw)
+        except ValueError:
+            raise ValueError(f"[ERROR] end_row must be an integer or blank, got: '{end_row_raw}'")
 
     # ── Make sure result_file ends with .xlsx ──────────────────────────────
     if not result_file.endswith(".xlsx"):
@@ -246,7 +264,7 @@ def main():
     # ── Read Excel ─────────────────────────────────────────────────────────
     print(f"\n[DEBUG] Reading Excel: {excel_file}, sheet: {sheet_name}")
     df = pd.read_excel(excel_file, sheet_name=sheet_name, dtype=str)
-    print(f"[DEBUG] Excel loaded — shape: {df.shape}")
+    print(f"[DEBUG] Excel loaded — full shape: {df.shape}")
     print(f"[DEBUG] Columns: {df.columns.tolist()}")
 
     for col in [utterances_col, intent_column, test_case_column, expected_output_col]:
@@ -255,7 +273,23 @@ def main():
         print(f"[DEBUG] ✅ Column found: '{col}'")
 
     df = df.reset_index(drop=True)
+
+    # ── Apply row range slice ──────────────────────────────────────────────
+    total_rows = len(df)
+    if end_row is not None:
+        df = df.iloc[start_row : end_row + 1]   # end_row is inclusive
+    else:
+        df = df.iloc[start_row:]
+
+    df = df.reset_index(drop=True)
     total = len(df)
+
+    print(f"[DEBUG] Row range   : start_row={start_row}, end_row={end_row if end_row is not None else total_rows - 1}")
+    print(f"[DEBUG] Rows to run : {total}  (sheet has {total_rows} data rows total)")
+
+    if total == 0:
+        print("[WARN] No rows to process after applying start_row/end_row. Exiting.")
+        return
 
     # ── Run intent detection via dfcx_scrapi ───────────────────────────────
     test_set = pd.DataFrame({
@@ -304,8 +338,6 @@ def main():
     print(f"\n🎯 MemberID extracted in {len(found)}/{len(results)} rows")
     print(results[[
         "utterance",
-        #"detected_intent",
-        #"intent_match",
         "extracted_member_id",
         "Expected Normalized Output",
         "Matching"
