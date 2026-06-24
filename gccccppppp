@@ -1,0 +1,13 @@
+Here's the table with the playbook each combo belongs to:
+
+| Head Intent | Sub Intent | Playbook |
+| ----------------- | --------------------------- | --------------------- |
+| Agent | vague-disability | Agent |
+| Benefits | benefits_life | Benefits |
+| BrokerCommissions | garbage-garbage | Other Intents |
+| Eligibility | eligibility_dental | Eligibility |
+| Eligibility | inquire-cobra | Eligibility |
+| Eligibility | vague-eligibility | Eligibility |
+| eServices | inquire-employer_e_services | Other Intents |
+| Renewals | inquire-renewals | Other Intents |
+
